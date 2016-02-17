@@ -17,118 +17,121 @@ library(qlexdatr)
 library(lexr)
 library(tidyr)
 library(spa)
+library(plyr)
 library(dplyr)
+library(magrittr)
 library(ggplot2)
-
-QLEX <- input_lex_data("qlexdatr")
-QLEX_DETECT_DATA <- lexr::make_detect_data(QLEX, hourly_interval = 6L)
-SECTIONS_FROM_TO <- QLEX_DETECT_DATA$distance
-```
-
-Next, we define a helper function for the distance between sections:
+library(ggrepel)  # devtools::install_github("slowkow/ggrepel")
 
 
-```r
-distance_sections <- function(sectionA, sectionB) {
-  # Returns pairwise distance between sections
-  sectionA <- as.character(sectionA)
-  sectionB <- as.character(sectionB)
-  stopifnot(length(sectionA) == length(sectionB))
+# WARNING: THIS WILL TAKE UP TO AN HOUR THE FIRST TIME IT'S RUN. THEN INSTANT, AS RESULTS ARE SAVED
+load_or_generate_data <- function(){
 
-  res <- vector(mode="integer", length=length(sectionA))
-
-  for (i in 1:length(res)) {
-    if (is.na(sectionA[i]) | is.na(sectionB[i])) {
-      res[i] = NA
-    } else {
-      res[i] <-   SECTIONS_FROM_TO %>%
-        filter(SectionFrom == sectionA[i], SectionTo == sectionB[i]) %>%
-        select(Distance) %>%
-        as.integer()
-    }
-  }
-  res
+  tryCatch(load(file = "QLEX_DETECT_DATA.RData", .GlobalEnv),
+           error = function(e) {
+             QLEX <- input_lex_data("qlexdatr")
+             HOURLY_INTERVALS = c(1L, 2L, 4L, 6L, 12L)
+             QLEX_DETECT_DATA <- list("1" = lexr::make_detect_data(QLEX, hourly_interval = 1L))
+             for (hourly_interval in HOURLY_INTERVALS) {
+               if (hourly_interval == 1) { next }
+               else {
+                 QLEX_DETECT_DATA[[as.character(hourly_interval)]] <-
+                   lexr::make_detect_data(QLEX, hourly_interval = hourly_interval)
+               }
+             }
+             save(QLEX_DETECT_DATA, file = "QLEX_DETECT_DATA.RData")
+             
+             #####
+             #####
+             #####
+             
+             SECTIONS_FROM_TO <- QLEX_DETECT_DATA[[1]]$distance
+             
+             distance_sections <- function(sectionA, sectionB) {
+               # Returns pairwise distance between sections
+               sectionA <- as.character(sectionA)
+               sectionB <- as.character(sectionB)
+               stopifnot(length(sectionA) == length(sectionB))
+               
+               res <- vector(mode="integer", length=length(sectionA))
+               
+               for (i in 1:length(res)) {
+                 if (is.na(sectionA[i]) | is.na(sectionB[i])) {
+                   res[i] = NA
+                 } else {
+                   res[i] <- SECTIONS_FROM_TO %>%
+                     filter(SectionFrom == sectionA[i], SectionTo == sectionB[i]) %>%
+                     select(Distance) %>%
+                     as.integer()
+                 }
+               }
+               res
+             }
+             
+             stopifnot(c(0, 0) == distance_sections(c("S01", "S01"), c("S01", "S01")))
+             
+             #####
+             #####
+             #####
+             
+             add_time_information <- function(detect_data){
+               detect_data$detection %<>%
+                 dplyr::left_join(detect_data$interval, by = c("IntervalDetection" = "Interval"))
+               detect_data
+             }
+             
+             for (i in 1:length(QLEX_DETECT_DATA)) {
+               QLEX_DETECT_DATA[[i]] <- add_time_information(QLEX_DETECT_DATA[[i]])
+             }
+             
+             #####
+             #####
+             #####
+             
+             add_consistency_score <- function(detect_data){
+               detect_data$detection %<>%
+                 group_by(Capture) %>%
+                 mutate(TimeDiff = IntervalDetection - lag(IntervalDetection)) %>%
+                 mutate(LocationDist = distance_sections(Section, lag(Section))) %>%
+                 filter(!is.na(TimeDiff)) %>%
+                 ungroup() %>%
+                 mutate(is_consistent = LocationDist <= TimeDiff) %>%
+                 rowwise %>%
+                 mutate(inconsistent_val = max(-1, as.integer(LocationDist - TimeDiff)))
+               
+               detect_data
+             }
+             
+             for (i in 1:length(QLEX_DETECT_DATA)) {
+               QLEX_DETECT_DATA[[i]] <- add_consistency_score(QLEX_DETECT_DATA[[i]])
+             }
+             
+             save(QLEX_DETECT_DATA, file = "QLEX_DETECT_DATA.RData")
+           })
 }
 
-stopifnot(0 == distance_sections("S01", "S01"))
-stopifnot(c(0, 0) == distance_sections(c("S01", "S01"), c("S01", "S01")))
+load_or_generate_data()
 ```
-
-
-For plotting we'll bring in the date information
-
-
-```r
-QLEX_DETECTION <- QLEX_DETECT_DATA$detection %>%
-  dplyr::left_join(QLEX_DETECT_DATA$interval, by = c("IntervalDetection" = "Interval"))
-
-QLEX_DETECTION %>%
-  filter(as.character(Capture) == "F001") %>%
-  ggplot(aes(x = DateTime, y = as.numeric(Section))) +
-  geom_point() +
-  geom_line()
-```
-
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-3-1.png) 
-
-## Calculate consistency and consistency_val
-
+  
 > By extension of our assumption a movement of a fish is **consistent** if the number of time intervals between detections does not exceed the distance between the sections that the fish was detected in.
 
 
-We now calculate the difference between the detection times `TimeDiff` and the distance between locations `LocationDist`. We then add the logical variable `consistent` and `consistent_val` to indicate whether any one particular movement was consistent with our assumption, and if not, by how many lake sections (or days) we are off, respectively.
+The variable `inconsistent_val` shows how inconsistent the fish movement is. If `inconsistent_val > 0` then the fish movement is inconsistent with our assumption that fish travel at most one section per day. In this case `inconsistent_val` says how many times, at least, the fish swam more than one section per day. E.g. if the fish was detected 3 sections away 2 days later, `inconsistent_val = 3-2 = 1`, if the fish was detected 10 sections away on the next day, then `inconsistent_val = 10-1 = 9`.
 
+In contrast, `inconsistent_val = 0` indicated that the fish swam *on average* one section per day, that is, the fish was detected exactly $n$ sections aways $n$ days later, $n \geq 1$.
 
-```r
-QLEX_DETECTION %<>%
-  group_by(Capture) %>%
-  mutate(TimeDiff = IntervalDetection - lag(IntervalDetection)) %>%
-  mutate(LocationDist = distance_sections(Section, lag(Section))) %>%
-  filter(!is.na(TimeDiff)) %>%
-  ungroup() %>%
-  mutate(consistent = LocationDist <= TimeDiff) %>%
-  rowwise %>%
-  mutate(consistent_val = max(-1, as.integer(LocationDist - TimeDiff)))
+Finally, if the fish swam less than one section per day we set `inconsistent_val = -1`. That is, the fish was detected $k$ sections away $n$ days later, with $k < n$. We include the case where the fish was detected in the same section. In fact, this is the reason why we truncate at $-1$: Often fish don't seem to move at all, leading to large negative `inconsistent_val` values otherwise, which are not as informative. If a fish doesn't move it shouldn't matter if we detect it in the same section every day or not.
 
-glimpse(QLEX_DETECTION)
-```
-
-```
-## Observations: 109,474
-## Variables: 15
-## $ IntervalDetection (int) 85, 86, 86, 88, 89, 90, 91, 92, 93, 93, 94, ...
-## $ Section           (fctr) S20, S20, S20, S20, S20, S20, S20, S20, S20...
-## $ Capture           (fctr) F014, F014, F015, F015, F015, F015, F015, F...
-## $ Receivers         (int) 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,...
-## $ Detections        (int) 2, 6, 3, 62, 26, 17, 5, 2, 48, 10, 30, 5, 30...
-## $ Date              (date) 2013-05-08, 2013-05-08, 2013-05-08, 2013-05...
-## $ Year              (int) 2013, 2013, 2013, 2013, 2013, 2013, 2013, 20...
-## $ Month             (int) 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,...
-## $ Hour              (int) 0, 6, 6, 18, 0, 6, 12, 18, 0, 0, 6, 6, 12, 0...
-## $ DayteTime         (time) 2000-05-08 00:00:00, 2000-05-08 06:00:00, 2...
-## $ DateTime          (time) 2013-05-08 00:00:00, 2013-05-08 06:00:00, 2...
-## $ TimeDiff          (int) 2, 1, 2, 2, 1, 1, 1, 1, 9, 1, 1, 5, 1, 1, 1,...
-## $ LocationDist      (int) 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0,...
-## $ consistent        (lgl) TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TR...
-## $ consistent_val    (dbl) -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, ...
-```
-
-The variable `consistent_val` shows how consistent or inconsistent the fish movement is. If `consistent_val > 0` then the fish movement is not consistent with our assumption that fish travel at most one section per day. In this case `consistent_val` says how many times, at least, the fish swam more than one section per day. E.g. if the fish was detected 3 sections away 2 days later, `consistent_val = 3-2 = 1`, if the fish was detected 10 sections away on the next day, then `consistent_val = 10-1 = 9`.
-
-In contrast, `consistent_val = 0` indicated that the fish swam *on average* one section per day, that is, the fish was detected exactly $n$ sections aways $n$ days later, $n \geq 1$.
-
-Finally, if the fish swam less than one section per day we set `consistent_val = -1`. That is, the fish was detected $k$ sections away $n$ days later, with $k < n$. We include the case where the fish was detected in the same section. In fact, this is the reason why we truncate at $-1$: Often fish don't seem to move at all, leading to large negative `consistent_val` values otherwise, which are not as informative. If a fish doesn't move it shouldn't matter if we detect it in the same section every day or not.
-
-Note that `consistent_val` and `consistent` are both an underestimate of the error we make with our model assumption. It is possible that fish swim more than one section per day and are still listed as consistent, due to the non-perfect coverage. An inconsistent movement may not always be detected if the receiver in the violating section did not register the fast fish.
+Note that `inconsistent_val` and `is_consistent` are both an underestimate of the error we make with our model assumption. It is possible that fish swim more than one section per day and are still listed as consistent, due to the non-perfect coverage. An inconsistent movement may not always be detected if the receiver in the violating section did not register the fast fish.
 
 
 Here is a visualization of our result so far:
 
 
 ```r
-QLEX_DETECTION %>%
+QLEX_DETECT_DATA[[1]]$detection %>%
   ggplot(aes(x = as.integer(TimeDiff), y = LocationDist)) +
-  geom_abline(intercept = 0, slope = 1, size = 2, color = "red") +
+  geom_abline(intercept = 0.5, slope = 1, size = 2, color = "red") +
   stat_sum(aes(size = ..n..), geom = "point") +
   scale_size_area(max_size = 10) +
   xlim(0, 15) +
@@ -137,10 +140,10 @@ QLEX_DETECTION %>%
 ```
 
 ```
-## Warning: Removed 3130 rows containing non-finite values (stat_sum).
+## Warning: Removed 17672 rows containing non-finite values (stat_sum).
 ```
 
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-5-1.png) 
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-2-1.png) 
 
 We see that the most observations are fish which are detected in the same section on the next day.
 
@@ -148,41 +151,95 @@ We see that the most observations are fish which are detected in the same sectio
 Here are a few more metrics that may be useful
 
 ```r
-QLEX_DETECTION %>%
-  summarise(frac_consistent = sum(consistent) / n()) %>%
-  summarize(grand_mean = mean(frac_consistent))
+plot_grand_mean_frac_consistent <- function(){
+  lapply(X = QLEX_DETECT_DATA, FUN = function(x) {
+    x$detection %>% 
+      dplyr::summarise(frac_consistent = sum(is_consistent) / n()) %>%
+      summarize(grand_mean = mean(frac_consistent))
+  }) %>% 
+    ldply(.fun = data.frame) %>% 
+    transmute(time_diff_in_hours = as.numeric(.id),
+              grand_mean_frac_consistent = grand_mean) %>% 
+    ggplot(aes(x = time_diff_in_hours, y = grand_mean_frac_consistent)) +
+    geom_point(size = 5) +
+    geom_line(size = 2) +
+    xlab("Length of time intervals (hours)") +
+    ylab("Grand mean of fractions of consistent movements per fish")
+}
+plot_grand_mean_frac_consistent()
 ```
 
-```
-## Source: local data frame [1 x 1]
-## 
-##   grand_mean
-##        (dbl)
-## 1  0.9636991
-```
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-3-1.png) 
 
 ```r
-QLEX_DETECTION %>%
-  ggplot(aes(x = consistent_val, fill = consistent)) +
-  geom_histogram(binwidth = 1)
+#QLEX_DETECT_DATA[[1]]$detection %>%
+#  ggplot(aes(x = consistent_val, fill = consistent)) +
+#  geom_histogram(binwidth = 1)
 ```
 
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-6-1.png) 
+
+
+```r
+plot_frac_totally_consistent <- function(){
+  lapply(X = QLEX_DETECT_DATA, FUN = function(x) {
+  x$detection %>% 
+    group_by(Capture) %>% 
+    summarise(totally_consistent = all(is_consistent)) %>% 
+    summarise(frac_totally_consistent = sum(totally_consistent) / n())
+}) %>% 
+  ldply(.fun = data.frame) %>% 
+  transmute(time_diff_in_hours = as.numeric(.id),
+            frac_totally_consistent = frac_totally_consistent ) %>% 
+  ggplot(aes(x = time_diff_in_hours, y = frac_totally_consistent)) +
+    geom_point(size = 5) +
+    geom_line(size = 2) +
+    xlab("Length of time intervals (hours)") +
+    ylab("Fractions of fish that are totally consistent")
+}
+
+plot_frac_totally_consistent()
+```
+
+```
+## Warning: Grouping rowwise data frame strips rowwise nature
+```
+
+```
+## Warning: Grouping rowwise data frame strips rowwise nature
+```
+
+```
+## Warning: Grouping rowwise data frame strips rowwise nature
+```
+
+```
+## Warning: Grouping rowwise data frame strips rowwise nature
+```
+
+```
+## Warning: Grouping rowwise data frame strips rowwise nature
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-4-1.png) 
+
+We see that reducing the length of the time intervals has huge benefits to the consistency of the data.
+
+
 
 ## Understanding inconsistencies on a fish-by-fish basis
 
-Next we want to better understand the inconsistent movements, where the largest `consistent_val` values are most concerning. To this end we add a couple consistency-related statistics to each fish.
+Next we want to better understand the inconsistent movements, where the largest `inconsistent_val` values are most concerning. To this end we add a couple consistency-related statistics to each fish.
 
 
 ```r
-QLEX_DETECTION %<>%
+QLEX_DETECT_DATA[[1]]$detection %<>%
   group_by(Capture) %>%
   mutate(n_obs = length(DateTime),
-         n_consistent = sum(consistent),
-         perc_consistent = sum(consistent)/length(consistent),
-         mean_consistent_val = mean(consistent_val),
-         max_consistent_val = max(consistent_val),
-         median_consistent_val = quantile(consistent_val, 0.5)
+         n_consistent = sum(is_consistent),
+         frac_consistent = sum(is_consistent)/length(is_consistent),
+         mean_inconsistent_val = mean(inconsistent_val),
+         max_inconsistent_val = max(inconsistent_val),
+         median_inconsistent_val = quantile(inconsistent_val, 0.5)
   ) %>%
   ungroup()
 ```
@@ -192,23 +249,23 @@ QLEX_DETECTION %<>%
 ```
 
 ```r
-QLEX_DETECTION %>%
-  ggplot(aes(x = perc_consistent, y = reorder(Capture, perc_consistent))) +
-  geom_point(aes(size = n_obs, color = max_consistent_val))
+QLEX_DETECT_DATA[[1]]$detection %>%
+  ggplot(aes(x = frac_consistent, y = reorder(Capture, frac_consistent))) +
+  geom_point(aes(size = n_obs, color = max_inconsistent_val))
 ```
 
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-7-1.png) 
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-5-1.png) 
 
 Or, plotting the same data sorted by their maximal consistent value:
 
 
 ```r
-QLEX_DETECTION %>%
-  ggplot(aes(x = perc_consistent, y = reorder(Capture, max_consistent_val))) +
-  geom_point(aes(size = n_obs, color = max_consistent_val))
+QLEX_DETECT_DATA[[1]]$detection %>%
+  ggplot(aes(x = frac_consistent, y = reorder(Capture, max_inconsistent_val))) +
+  geom_point(aes(size = n_obs, color = max_inconsistent_val))
 ```
 
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-8-1.png) 
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-6-1.png) 
 
 For starters, we see that there is a number of fish who are always consistent.
 
@@ -216,8 +273,8 @@ For starters, we see that there is a number of fish who are always consistent.
 
 
 ```r
-QLEX_DETECTION %>%
-  filter(perc_consistent == 1) %>%
+QLEX_DETECT_DATA[[1]]$detection %>%
+  filter(frac_consistent == 1) %>%
   ggplot(aes(x = DateTime, y = as.numeric(Section))) +
   geom_line() +
   geom_point(size = 5) +
@@ -229,37 +286,190 @@ QLEX_DETECTION %>%
 ## adjust the group aesthetic?
 ```
 
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-7-1.png) 
+
+
+### Fish with largest `inconsistent_val`, that is, the most inconsistent
+
+
+```r
+QLEX_DETECT_DATA[[1]]$detection %>%
+  filter(max_inconsistent_val > max(QLEX_DETECT_DATA[[1]][["detection"]][["inconsistent_val"]]) - 2) %>%
+  ggplot(aes(x = DateTime, y = as.numeric(Section))) +
+   geom_line() +
+   geom_point(aes(size = 2, colour = Hour)) +
+   facet_wrap(~ Capture, ncol = 3) +
+   theme(legend.position="none")
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-8-1.png) 
+
+
+```r
+bad_fish <- QLEX_DETECT_DATA[[1]]$detection %>%
+  filter(max_inconsistent_val > max(QLEX_DETECT_DATA[[1]][["detection"]][["inconsistent_val"]] - 1)) %>% 
+  select(Capture) %>% 
+  unique()
+
+
+plot_inconsistency_timeline_per_fish <- function(df, cap) {
+  temp <- df %>%
+    filter(Capture == cap) %>%
+    rowwise() %>%
+    mutate(my_str = if (inconsistent_val > 0) as.character(inconsistent_val) else "")
+
+  temp %>%
+    ggplot(aes(x = DateTime, y = as.numeric(Section))) +
+    geom_line(aes(size = inconsistent_val + 1)) +
+    geom_point(aes(size = 2)) +
+    geom_text_repel(data = subset(temp, my_str != ""), aes(label = my_str), size = 8, colour = "red") +
+    #geom_text(data = subset(temp, my_str != ""), aes(label = my_str), size = 8) +
+    ggtitle(cap) +
+    theme(legend.position="none")
+}
+
+apply(bad_fish, 1, plot_inconsistency_timeline_per_fish, df = QLEX_DETECT_DATA[[1]]$detection)
+```
+
+```
+## [[1]]
+```
+
 ![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-1.png) 
 
-We see that these 14442 fish are perfectly consistent, great!
+```
+## 
+## [[2]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-2.png) 
+
+```
+## 
+## [[3]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-3.png) 
+
+```
+## 
+## [[4]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-4.png) 
+
+```
+## 
+## [[5]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-5.png) 
+
+```
+## 
+## [[6]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-6.png) 
+
+```
+## 
+## [[7]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-7.png) 
+
+```
+## 
+## [[8]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-8.png) 
+
+```
+## 
+## [[9]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-9.png) 
+
+```
+## 
+## [[10]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-10.png) 
+
+```
+## 
+## [[11]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-11.png) 
+
+```
+## 
+## [[12]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-12.png) 
+
+```
+## 
+## [[13]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-13.png) 
+
+```
+## 
+## [[14]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-14.png) 
+
+```
+## 
+## [[15]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-15.png) 
+
+```
+## 
+## [[16]]
+```
+
+![](qlesdatr_consistency_files/figure-html/unnamed-chunk-9-16.png) 
 
 
 
-### Fish with largest `consistent_val`, that is, the most inconsistent
+Finally, we're writing our results to a csv file.
 
 
 ```r
-QLEX_DETECTION %>%
-  filter(max_consistent_val >= max(QLEX_DETECTION$consistent_val) - 2) %>%
-  ggplot(aes(x = DateTime, y = as.numeric(Section))) +
-  geom_line(aes(size = consistent_val)) +
-  geom_point(aes(size = 5, color = DateTime)) +
-  facet_wrap(~ Capture, ncol = 2)
+QLEX_DETECT_DATA[[1]]$detection %>% 
+  group_by(Capture) %>% 
+  summarize(n_obs = n(),
+            n_consistent = sum(is_consistent),
+            n_inconsistent = sum(!is_consistent),
+            frac_consistent = min(frac_consistent),
+            largest_jump = max(inconsistent_val)
+  ) %>% 
+  join(
+    QLEX_DETECT_DATA[[1]]$detection %>% 
+      group_by(Capture) %>% 
+      filter(TimeDiff < 24) %>% 
+      summarize(max_jump_in_24h = max(LocationDist)) %>% 
+      join(qlexdatr::capture %>% 
+             select(Capture, Species))
+  ) %>% 
+  write.csv(file = "overview_per_fish_qlexdatr.csv",
+            row.names = FALSE,
+            quote = FALSE)
 ```
 
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-10-1.png) 
-
-```r
-QLEX_DETECTION %>%
-  filter(max_consistent_val >= max(QLEX_DETECTION$consistent_val) - 2) %>%
-  rowwise() %>%
-  mutate(my_str = if (consistent_val > 0) as.character(consistent_val) else "") %>%
-  ggplot(aes(x = DateTime, y = as.numeric(Section))) +
-    geom_line(aes(size = consistent_val)) +
-    geom_point(aes(size = 5)) +
-    geom_text(aes(label = my_str), hjust = 1.5, size = 8) +
-    facet_wrap(~ Capture)
 ```
-
-![](qlesdatr_consistency_files/figure-html/unnamed-chunk-10-2.png) 
-
+## Joining by: Capture
+## Joining by: Capture
+```
